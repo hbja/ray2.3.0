@@ -11,22 +11,27 @@ import io.ray.api.function.PyActorMethod;
 import io.ray.api.options.ActorLifetime;
 import io.ray.serve.common.Constants;
 import io.ray.serve.config.RayServeConfig;
+import io.ray.serve.dag.Graph;
+import io.ray.serve.deployment.Application;
 import io.ray.serve.deployment.Deployment;
 import io.ray.serve.deployment.DeploymentCreator;
 import io.ray.serve.deployment.DeploymentRoute;
 import io.ray.serve.exception.RayServeException;
 import io.ray.serve.generated.ActorNameList;
+import io.ray.serve.handle.RayServeHandle;
 import io.ray.serve.poll.LongPollClientFactory;
 import io.ray.serve.replica.ReplicaContext;
 import io.ray.serve.util.CollectionUtil;
 import io.ray.serve.util.CommonUtil;
-import io.ray.serve.util.LogUtil;
+import io.ray.serve.util.MessageFormatter;
 import io.ray.serve.util.ServeProtoUtil;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,20 +57,41 @@ public class Serve {
    * @param config Configuration options for Serve.
    * @return
    */
+  @Deprecated
   public static synchronized ServeControllerClient start(
       boolean detached, boolean dedicatedCpu, Map<String, String> config) {
-    // Initialize ray if needed.
-    if (!Ray.isInitialized()) {
-      System.setProperty("ray.job.namespace", Constants.SERVE_NAMESPACE);
-      Ray.init();
-    }
+    return serveStart(detached, dedicatedCpu, config);
+  }
+
+  /**
+   * Initialize a serve instance.
+   *
+   * <p>By default, the instance will be scoped to the lifetime of the returned Client object (or
+   * when the script exits). If detached is set to True, the instance will instead persist until
+   * Serve.shutdown() is called. This is only relevant if connecting to a long-running Ray cluster.
+   *
+   * @param detached Whether not the instance should be detached from this script. If set, the
+   *     instance will live on the Ray cluster until it is explicitly stopped with Serve.shutdown().
+   * @param dedicatedCpu Whether to reserve a CPU core for the internal Serve controller actor.
+   *     Defaults to False.
+   * @param config Configuration options for Serve.
+   * @return
+   */
+  public static synchronized ServeControllerClient serveStart(
+      boolean detached, boolean dedicatedCpu, Map<String, String> config) {
 
     try {
       ServeControllerClient client = getGlobalClient(true);
       LOGGER.info("Connecting to existing Serve app in namespace {}", Constants.SERVE_NAMESPACE);
       return client;
     } catch (RayServeException | IllegalStateException e) {
-      LOGGER.info("There is no instance running on this Ray cluster. A new one will be started.");
+      LOGGER.info(
+          "There is no Serve instance running on this Ray cluster. A new one will be started.");
+    }
+
+    // Initialize ray if needed.
+    if (!Ray.isInitialized()) {
+      init();
     }
 
     String controllerName =
@@ -74,11 +100,12 @@ public class Serve {
             : CommonUtil.formatActorName(
                 Constants.SERVE_CONTROLLER_NAME, RandomStringUtils.randomAlphabetic(6));
 
+    System.getProperty(controllerName);
     int httpPort =
         Optional.ofNullable(config)
             .map(m -> m.get(RayServeConfig.PROXY_HTTP_PORT))
             .map(Integer::parseInt)
-            .orElse(8000);
+            .orElse(Integer.valueOf(System.getProperty(RayServeConfig.PROXY_HTTP_PORT, "8000")));
     PyActorHandle controllerAvatar =
         Ray.actor(
                 PyActorClass.of("ray.serve.controller", "ServeControllerAvatar"),
@@ -113,7 +140,7 @@ public class Serve {
         }
       } catch (RayTimeoutException e) {
         String errMsg =
-            LogUtil.format("Proxies not available after {}s.", Constants.PROXY_TIMEOUT_S);
+            MessageFormatter.format("Proxies not available after {}s.", Constants.PROXY_TIMEOUT_S);
         LOGGER.error(errMsg, e);
         throw new RayServeException(errMsg, e);
       }
@@ -222,12 +249,7 @@ public class Serve {
       LOGGER.info("The cached controller has died. Reconnecting.");
       setGlobalClient(null);
     }
-    synchronized (ServeControllerClient.class) {
-      if (GLOBAL_CLIENT != null) {
-        return GLOBAL_CLIENT;
-      }
-      return connect();
-    }
+    return connect();
   }
 
   public static ServeControllerClient getGlobalClient() {
@@ -249,13 +271,19 @@ public class Serve {
    *
    * @return
    */
-  public static ServeControllerClient connect() {
-    // Initialize ray if needed.
-    if (!Ray.isInitialized()) {
-      System.setProperty("ray.job.namespace", Constants.SERVE_NAMESPACE);
-      Ray.init();
+  private static synchronized ServeControllerClient connect() {
+
+    if (GLOBAL_CLIENT != null) {
+      return GLOBAL_CLIENT;
     }
 
+    // Initialize ray if needed.
+    if (!Ray.isInitialized()) {
+      init();
+    }
+
+    // When running inside of a replica, _INTERNAL_REPLICA_CONTEXT is set to ensure that the correct
+    // instance is connected to.
     String controllerName =
         INTERNAL_REPLICA_CONTEXT != null
             ? INTERNAL_REPLICA_CONTEXT.getInternalControllerName()
@@ -264,8 +292,8 @@ public class Serve {
     Optional<BaseActorHandle> optional = Ray.getActor(controllerName, Constants.SERVE_NAMESPACE);
     Preconditions.checkState(
         optional.isPresent(),
-        LogUtil.format(
-            "There is no instance running on this Ray cluster. "
+        MessageFormatter.format(
+            "There is no Serve instance running on this Ray cluster. "
                 + "Please call `serve.start(detached=True) to start one."));
     LOGGER.info(
         "Got controller handle with name `{}` in namespace `{}`.",
@@ -287,23 +315,21 @@ public class Serve {
    * @param name name of the deployment. This must have already been deployed.
    * @return Deployment
    */
+  @Deprecated
   public static Deployment getDeployment(String name) {
     DeploymentRoute deploymentRoute = getGlobalClient().getDeploymentInfo(name);
     if (deploymentRoute == null) {
       throw new RayServeException(
-          LogUtil.format("Deployment {} was not found. Did you call Deployment.deploy?", name));
+          MessageFormatter.format("Deployment {} was not found. Did you call Deployment.deploy?", name));
     }
 
     // TODO use DeploymentCreator
     return new Deployment(
-        deploymentRoute.getDeploymentInfo().getReplicaConfig().getDeploymentDef(),
         name,
         deploymentRoute.getDeploymentInfo().getDeploymentConfig(),
+        deploymentRoute.getDeploymentInfo().getReplicaConfig(),
         deploymentRoute.getDeploymentInfo().getVersion(),
-        null,
-        deploymentRoute.getDeploymentInfo().getReplicaConfig().getInitArgs(),
-        deploymentRoute.getRoute(),
-        deploymentRoute.getDeploymentInfo().getReplicaConfig().getRayActorOptions());
+        deploymentRoute.getRoute());
   }
 
   /**
@@ -323,15 +349,51 @@ public class Serve {
       deployments.put(
           entry.getKey(),
           new Deployment(
-              entry.getValue().getDeploymentInfo().getReplicaConfig().getDeploymentDef(),
               entry.getKey(),
               entry.getValue().getDeploymentInfo().getDeploymentConfig(),
+              entry.getValue().getDeploymentInfo().getReplicaConfig(),
               entry.getValue().getDeploymentInfo().getVersion(),
-              null,
-              entry.getValue().getDeploymentInfo().getReplicaConfig().getInitArgs(),
-              entry.getValue().getRoute(),
-              entry.getValue().getDeploymentInfo().getReplicaConfig().getRayActorOptions()));
+              entry.getValue().getRoute()));
     }
     return deployments;
+  }
+
+  public static Optional<RayServeHandle> run(Application target) {
+    return run(target, true, Constants.SERVE_DEFAULT_APP_NAME, null, null);
+  }
+
+  public static Optional<RayServeHandle> run(
+      Application target,
+      boolean blocking,
+      String name,
+      String routePrefix,
+      Map<String, String> config) {
+
+    if (StringUtils.isBlank(name)) {
+      throw new RayServeException("Application name must a non-empty string.");
+    }
+
+    ServeControllerClient client = serveStart(true, false, config);
+
+    List<Deployment> deployments = Graph.build(target.getInternalDagNode(), name);
+    Deployment ingress = Graph.getAndValidateIngressDeployment(deployments);
+    for (Deployment deployment : deployments) {
+      client.deploy(
+          deployment.getName(),
+          deployment.getReplicaConfig(),
+          deployment.getDeploymentConfig(),
+          deployment.getVersion(),
+          routePrefix,
+          deployment.getUrl(),
+          blocking);
+    }
+
+    return Optional.ofNullable(ingress)
+        .map(ingressDeployment -> client.getHandle(ingressDeployment.getName(), true));
+  }
+
+  private static void init() {
+    System.setProperty("ray.job.namespace", Constants.SERVE_NAMESPACE);
+    Ray.init();
   }
 }

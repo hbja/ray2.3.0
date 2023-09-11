@@ -14,7 +14,7 @@ import io.ray.serve.exception.RayServeException;
 import io.ray.serve.generated.RequestMetadata;
 import io.ray.serve.metrics.RayServeMetrics;
 import io.ray.serve.router.Query;
-import io.ray.serve.util.LogUtil;
+import io.ray.serve.util.MessageFormatter;
 import io.ray.serve.util.ReflectUtil;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -193,7 +193,7 @@ public class RayServeReplicaImpl implements RayServeReplica {
     } catch (Throwable e) {
       RayServeMetrics.execute(() -> errorCounter.inc(1.0));
       throw new RayServeException(
-          LogUtil.format(
+          MessageFormatter.format(
               "Replica {} failed to invoke method {}",
               replicaTag,
               methodToCall == null ? "unknown" : methodToCall.getName()),
@@ -221,7 +221,7 @@ public class RayServeReplicaImpl implements RayServeReplica {
       return ReflectUtil.getMethod(callable.getClass(), methodName, args);
     } catch (NoSuchMethodException e) {
       String errMsg =
-          LogUtil.format(
+          MessageFormatter.format(
               "Tried to call a method {} that does not exist. Available methods: {}",
               methodName,
               ReflectUtil.getMethodStrings(callable.getClass()));
@@ -305,7 +305,7 @@ public class RayServeReplicaImpl implements RayServeReplica {
       return version;
     } catch (NoSuchMethodException e) {
       String errMsg =
-          LogUtil.format(
+          MessageFormatter.format(
               "userConfig specified but deployment {} missing {} method",
               deploymentName,
               Constants.RECONFIGURE_METHOD);
@@ -313,7 +313,7 @@ public class RayServeReplicaImpl implements RayServeReplica {
       throw new RayServeException(errMsg, e);
     } catch (Throwable e) {
       String errMsg =
-          LogUtil.format(
+          MessageFormatter.format(
               "Replica {} of deployment {} failed to reconfigure userConfig {}",
               replicaTag,
               deploymentName,
