@@ -514,6 +514,9 @@ class EnvRunnerV2:
 
                 policy_id: PolicyID = episode.policy_for(agent_id)
 
+                # Collect raw and filtered observations
+                episode._set_last_raw_obs(agent_id, obs)
+
                 agent_terminated = bool(
                     terminateds[env_id]["__all__"] or terminateds[env_id].get(agent_id)
                 )

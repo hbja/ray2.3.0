@@ -2,6 +2,7 @@ import random
 from collections import defaultdict
 import numpy as np
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+import tree
 
 from ray.rllib.env.base_env import _DUMMY_AGENT_ID
 from ray.rllib.evaluation.collectors.simple_list_collector import (
@@ -12,7 +13,8 @@ from ray.rllib.evaluation.collectors.agent_collector import AgentCollector
 from ray.rllib.policy.policy_map import PolicyMap
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.annotations import DeveloperAPI
-from ray.rllib.utils.typing import AgentID, EnvID, PolicyID, TensorType
+from ray.rllib.utils.spaces.space_utils import flatten_to_single_ndarray
+from ray.rllib.utils.typing import AgentID, EnvID, PolicyID, TensorType, EnvInfoDict, EnvObsType, EnvActionType
 
 if TYPE_CHECKING:
     from ray.rllib.algorithms.callbacks import DefaultCallbacks
@@ -89,6 +91,15 @@ class EpisodeV2:
         # Summed rewards broken down by agent.
         self.agent_rewards: Dict[Tuple[AgentID, PolicyID], float] = defaultdict(float)
         self._agent_reward_history: Dict[AgentID, List[int]] = defaultdict(list)
+
+        # Agent observations
+        self._agent_to_last_obs: Dict[AgentID, EnvObsType] = {}
+        self._agent_to_last_raw_obs: Dict[AgentID, EnvObsType] = {}
+
+        # Agent actions
+        self._agent_to_last_extra_action_outs: Dict[AgentID, dict] = {}
+        self._agent_to_prev_action: Dict[AgentID, EnvActionType] = {}
+        self._agent_to_last_action: Dict[AgentID, EnvActionType] = {}
 
         self._has_init_obs: Dict[AgentID, bool] = {}
         self._last_terminateds: Dict[AgentID, bool] = {}
@@ -367,6 +378,87 @@ class EpisodeV2:
 
     def set_last_info(self, agent_id: AgentID, info: Dict):
         self._last_infos[agent_id] = info
+
+    def _set_last_observation(self, agent_id, obs):
+        self._agent_to_last_obs[agent_id] = obs
+
+    def _set_last_raw_obs(self, agent_id, obs):
+        self._agent_to_last_raw_obs[agent_id] = obs
+
+    def _set_last_action(self, agent_id, action):
+        if agent_id in self._agent_to_last_action:
+            self._agent_to_prev_action[agent_id] = self._agent_to_last_action[agent_id]
+        self._agent_to_last_action[agent_id] = action
+
+    def last_info_for(
+            self, agent_id: AgentID = _DUMMY_AGENT_ID
+    ) -> Optional[EnvInfoDict]:
+        return self._last_infos.get(agent_id)
+
+    def last_reward_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> float:
+        history = self._agent_reward_history[agent_id]
+        # We are at t > 0 -> Return previously received reward.
+        if len(history) >= 1:
+            return history[-1]
+        # We're at t=0, so there is no previous reward, just return zero.
+        else:
+            return 0.0
+
+    def prev_reward_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> float:
+        history = self._agent_reward_history[agent_id]
+        # We are at t > 1 -> Return reward prior to most recent (last) one.
+        if len(history) >= 2:
+            return history[-2]
+        # We're at t <= 1, so there is no previous reward, just return zero.
+        else:
+            return 0.0
+
+    def last_observation_for(
+        self, agent_id: AgentID = _DUMMY_AGENT_ID
+    ) -> Optional[EnvObsType]:
+        return self._agent_to_last_obs.get(agent_id)
+
+    def last_raw_obs_for(
+        self, agent_id: AgentID = _DUMMY_AGENT_ID
+    ) -> Optional[EnvObsType]:
+        return self._agent_to_last_raw_obs.get(agent_id)
+
+    def last_action_for(self, agent_id: AgentID = _DUMMY_AGENT_ID) -> EnvActionType:
+        """Returns the last action for the specified AgentID, or zeros.
+
+        The "last" action is the most recent one taken by the agent.
+
+        Args:
+            agent_id: The agent's ID to get the last action for.
+
+        Returns:
+            Last action the specified AgentID has executed.
+            Zeros in case the agent has never performed any actions in the
+            episode.
+        """
+        policy_id = self.policy_for(agent_id)
+        policy = self.policy_map[policy_id]
+
+        # Agent has already taken at least one action in the episode.
+        if agent_id in self._agent_to_last_action:
+            if policy.config.get("_disable_action_flattening"):
+                return self._agent_to_last_action[agent_id]
+            else:
+                return flatten_to_single_ndarray(self._agent_to_last_action[agent_id])
+        # Agent has not acted yet, return all zeros.
+        else:
+            if policy.config.get("_disable_action_flattening"):
+                return tree.map_structure(
+                    lambda s: np.zeros_like(s.sample(), s.dtype)
+                    if hasattr(s, "dtype")
+                    else np.zeros_like(s.sample()),
+                    policy.action_space_struct,
+                )
+            else:
+                flat = flatten_to_single_ndarray(policy.action_space.sample())
+                if hasattr(policy.action_space, "dtype"):
+                    return np.zeros_like(flat, dtype=policy.action_space.dtype)
+                return np.zeros_like(flat)
 
     @property
     def length(self):
